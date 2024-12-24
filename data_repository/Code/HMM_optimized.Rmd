@@ -1,0 +1,146 @@
+---
+title: "HMM optimized"
+output: html_notebook
+---
+
+This file contains code to run a Hidden Markov Model on GPS tracks, which uses step lengths and turning angles to determine different behavioral states along the track. The code performs only one iteration of the HMM with starting values based on a "best model" Rdatafile which is outputted by HMM_model_iterate.Rmd. It then selects and stores the output of the different states in the input dataframe.
+
+The input CSV file should have the following columns:
+1. ID (string or integer): Unique identifier for each device or bird.
+2. track_ID (string or integer): Unique identifier for each track segment.
+3. time (datetime): Timestamp of each data point in the format "YYYY-MM-DD HH:MM:SS".
+4. x (numeric): UTM x-coordinate of the data point.
+5. y (numeric): UTM y-coordinate of the data point.
+
+An RDS-file containing parameter values of a "best model" should also be available.
+
+This code was written by Emily Manzo and adapted by Eva de Jonghe. The code is based on the model code from Dr. E.N. (Eldar) Rakhimberdiev, which can be found in the HMM_model_iterate file.
+
+```{r}
+# Load required libraries
+library(momentuHMM)
+library(bayesmove)
+library(tidyverse)
+library(terra)
+```
+
+# prepare data
+```{r}
+# prepare data for HMM model
+# read in data
+gullsubs <- read.csv("bird_317_preprocessed.csv")
+
+# change the "ID" column so the HMM takes separate tracks into account
+gullsubs <- gullsubs %>% rename("device" = "ID", "ID" = "track_ID")
+
+# if HMM gives the error that there are not enough input values --> remove duplicates
+#gullsubs <- gullsubs[!duplicated(gullsubs[2]), ] 
+
+# for subsetting large datasets
+#gullsubs <- gull5999 |> subset(date_time > as.POSIXct('2021-04-09 00:00:00', tz="UTC") & date_time < as.POSIXct('2021-07-09 00:00:00', tz="UTC")) # this one worked well for me...
+
+# read in RDS-file with best_model parameters
+best_model <- readRDS("best_model_100724.rds") #reads the model as an object in R, like it was when it was created
+```
+
+# HMM fitting function
+```{r}
+fit_hmm <- function(data,best_model){
+  
+  # prepare data for model
+  d.list<- df_to_list(data, ind = "device") #"device" value should be the same for all data
+  list1<- map(d.list, ~prepData(., type = "UTM", coordNames = c("x","y")))
+  
+  # extract best model parameters
+  stepPar <- as.vector(best_model$mle$step[c(1,3,5,7,9,11,13,
+                                             2,4,6,8,10,12,14)])
+  anglePar <- as.vector(abs(best_model$mle$angle[c(1,3,5,7,9,11,13,
+                                                   2,4,6,8,10,12,14)]))
+  dist <- best_model$conditions$dist
+  
+  # fit HMM
+  HMM_model <<- fitHMM(data = list1[[1]],
+                       nbStates = 7, 
+                       Par0 = list(step = stepPar, angle = anglePar),
+                       dist = dist,
+                       formula = ~ 1,
+                       stationary=TRUE,
+                       estAngleMean = list(angle=TRUE),
+                       stateNames = c("Stationary", "Float","ARS", "Exploratory Flight", "Transit", "Trawler", "Shrimp boat"),
+                       optMethod = "Nelder-Mead") 
+  
+  # extract predicted states
+  HMM_state <- viterbi(HMM_model)
+  
+  # map state numbers as corresponding name
+  state_mapping <- c("1" = "Stationary", "2" = "Float", "3" = "ARS", "4" = "Exploratory Flight", "5" = "Transit", "6" = "Trawler", "7" = "Shrimp boat") 
+  HMM_state <- state_mapping[HMM_state]
+  
+  return(HMM_state)
+}
+```
+
+# save HMM processed datafile
+```{r}
+# call HMM function
+HMM_States <- fit_hmm(gullsubs, best_model5)
+
+gullsubs$States <- HMM_States # add states to dataset
+
+# save processed data
+write.csv(gullsubs, "bird_317_preprocessed_HMM.csv", row.names = FALSE)
+```
+
+```{r}
+    # Load and prepare data
+    filepath <- file_list[1]
+    gullsubs <- read.csv(filepath)
+    gullsubs <- gullsubs %>% rename("device" = "ID", "ID" = "track_ID") # change the "ID" column so the HMM takes separate tracks into account
+    gullsubs <- gullsubs[!duplicated(gullsubs[2]), ] # remove duplicates
+
+
+```
+
+```{r}
+# read in RDS-file with best_model parameters
+best_model <- readRDS("best_model_100724.rds")
+
+file_list <- files_only_in_folder1
+  #list.files(path = "preprocessed_data", pattern = ".csv", full.names = TRUE)
+
+for (i in 1:5){
+  
+  tryCatch({ 
+    
+    # Load and prepare data
+    filepath <- file_list[i]
+    gullsubs <- read.csv(filepath)
+    gullsubs <- gullsubs %>% rename("device" = "ID", "ID" = "track_ID") # change the "ID" column so the HMM takes separate tracks into account
+    gullsubs <- gullsubs[!duplicated(gullsubs[2]), ] # remove duplicates
+    
+    # run HMM model
+    HMM_States <- fit_hmm(gullsubs, best_model)
+  
+    # add states to dataframe
+    gullsubs$States <- HMM_States
+  
+    # Create output file path
+    base_name <- tools::file_path_sans_ext(basename(filepath))
+    output_file <- file.path("HMM_processed_data", paste0(base_name, "_HMM.csv"))
+    
+    # Save the final processed dataset
+    write.csv(gullsubs, output_file, row.names = FALSE)
+    print(paste("Saved:", output_file))
+
+  
+  }, error = function(e) {
+    
+      # Print error message and continue with the next item
+    print(paste("Error processing", filepath, ":", e$message))
+  
+  })
+  
+}
+
+
+```

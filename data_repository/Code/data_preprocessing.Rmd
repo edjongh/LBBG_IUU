@@ -1,0 +1,332 @@
+---
+title: "Gull track data preparation"
+output: html_notebook
+---
+This file contains function and a main script which can be used to: 
+  1. convert GPS tracks from longitude and latitude to UTM format
+  2. subset the entire GPS track into separate tracks that occur above sea
+  3. filter and interpolate the GPS data so the time steps between datapoints are more uniform (around 5 mins)
+
+The input CSV file should have the following columns:
+1. date_time (string or datetime): Timestamp of each data point in the format "YYYY-MM-DD HH:MM:SS".
+2. device_info_serial (string or integer): Unique identifier for each device (e.g., bird or tracker ID).
+3. longitude (numeric): Longitude coordinate of the data point in decimal degrees.
+4. latitude (numeric): Latitude coordinate of the data point in decimal degrees.
+
+This code file was written by Dr. E.N. (Eldar) Rakhimberdiev and Eva de Jonghe
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(lubridate)
+library(sf)
+library(crawl)
+library(rnaturalearth)
+library(momentuHMM)
+```
+
+# functions
+```{r}
+# Function to read and rename data
+read_and_prep_data <- function(filepath) {
+  
+  data <- read.csv(filepath) # get data
+  data <- data %>% rename(time = date_time, ID = device_info_serial) # rename columns
+  
+  # correctly format data
+  data$time <- as.POSIXct(data$time, format = "%Y-%m-%d %H:%M:%S")
+  data$latitude <- as.numeric(data$latitude)
+  data$longitude <- as.numeric(data$longitude)
+  
+  # Remove rows with NA in longitude or latitude or time
+  data <- data %>% filter(!is.na(longitude) & !is.na(latitude) & !is.na(time))
+  
+  print("read_and_rename_data done!")
+  return(data)
+}
+``` 
+
+```{r}
+# Function to convert latitude and longitude to UTM
+convert_to_utm <- function(data) {
+  
+  # Create an sf object from the dataframe
+  data_sf <- st_as_sf(data, coords = c("longitude", "latitude"), crs = 4326)
+  
+  # Determine UTM zones
+  data$UTMzone <- floor((st_coordinates(data_sf)[,1] / 6) + 31)
+  
+  # Initialize empty vectors for UTM coordinates
+  data$x <- numeric(nrow(data))
+  data$y <- numeric(nrow(data))
+  
+  # Transform each point to its respective UTM zone
+  unique_zones <- unique(data$UTMzone)
+  
+  # convert lat and long to UTM
+  for (zone in unique_zones) {
+    
+    zone_indices <- which(data$UTMzone == zone)
+    zone_data_sf <- data_sf[zone_indices, ]
+    zone_crs <- paste0("+proj=utm +zone=", zone, " +datum=WGS84")
+    zone_utm <- st_transform(zone_data_sf, crs = zone_crs)
+    data$x[zone_indices] <- st_coordinates(zone_utm)[,1]
+    data$y[zone_indices] <- st_coordinates(zone_utm)[,2]
+  }
+  
+  print("convert_to_utm done!")
+  return(data)
+}
+```
+
+```{r}
+# Function to select only datapoints above sea, and give the tracks an ID
+sea_datapoints <- function(data) {
+  
+  # download land and lakes data from the 'naturalearthdata.com' website
+  # Land <- ne_download(category = 'physical', type = 'land', scale = 'large')
+  # Lakes <- ne_download(category = 'physical', type = 'lakes', scale = 'large') |> sf::st_make_valid()
+  
+  # convert df to an sf object (spatial object for handling geographic data)
+  data_sf <- sf::st_as_sf(data, coords = c("longitude", "latitude"), crs = "+proj=longlat")
+  
+  # check if points in 'data_sf' intersect with land or lake geometry
+  Over_Land <- sf::st_intersects(data_sf, Land) |> lengths() > 0  # points over Land
+  Over_Lakes <- sf::st_intersects(data_sf, Lakes) |> lengths() > 0  # points over Lakes
+  
+  # select points above sea by excluding points over land or lakes
+  At_Sea <- !Over_Land | Over_Lakes
+  
+  # add sea_indicator column to data indicating points is at sea
+  data$sea_indicator <- At_Sea
+  
+  # give all data rows an index
+  data$index <- seq(1:nrow(data))
+  
+  # make new dataframe with only the above sea points
+  datasea <- data[which(data$sea_indicator == TRUE),]
+  
+  # give all consecutive sea points unique track IDs based on index sequence
+  datasea$track_ID <- cumsum(c(TRUE, diff(datasea$index) != 1))
+  
+  print("sea_datapoints done!")
+  return(datasea)
+}
+```
+
+```{r}
+# Function to filter out very short tracks in terms of datapoints or duration
+clean_tracks <- function(datasea) {
+  
+  # Calculate time differences between rows per track and add as a new column 'dt'
+  datasea <- datasea %>%
+    group_by(track_ID) %>%
+    arrange(time) %>%
+    mutate(dt = as.numeric(difftime(time, lag(time), units = "secs"))) %>%
+    ungroup()
+  
+  # Calculate the duration of each track
+  track_durations <- datasea %>%
+    group_by(track_ID) %>%
+    summarise(
+      duration = as.numeric(difftime(max(time), min(time), units = "mins")),
+      n_points = n()
+    )
+  
+  # Identify track IDs with duration less than 30 minutes or less than 4 datapoints
+  short_tracks <- track_durations %>%
+    filter(duration < 30 | n_points < 4) %>%
+    pull(track_ID)
+  
+  # Filter out short tracks from the dataframe
+  datasea <- datasea %>%
+    filter(!(track_ID %in% short_tracks))
+  
+  print("clean_tracks done!")
+  return(datasea)
+}
+```
+
+```{r}
+# Function to generate a sequence of times for each track and select suitable datapoints for this sequence
+generate_time_sequence <- function(datasea) {
+  
+  data_select_list <- list()
+  sequence_time_list <- list()
+  closest_points_list <- list()
+  
+  # check per track
+  track_ids <- unique(datasea$track_ID)
+  
+  for (track_id in track_ids) {
+    
+    # subset data
+    track_data <- datasea %>% filter(track_ID == track_id)
+    
+    # Calculate time in seconds
+    track_data$time_seconds <- as.numeric(track_data$time)
+
+    # Determine the first and last points of the sequence
+    First_point <- min(track_data$time) |> as.numeric() 
+    Last_point <- max(track_data$time) |> as.numeric()
+    
+    # Generate the sequence of times with 5 minute steps
+    Sequence <- seq(from = First_point, to = Last_point, by = 300)
+    Sequence_time <- as.POSIXct(Sequence)
+    
+    # Convert sequence times to seconds
+    Sequence_time_seconds <- as.numeric(Sequence_time)
+    
+    # Find the closest points in the original data
+    Closest_points <- sapply(Sequence_time_seconds, function(x) which.min(abs(track_data$time_seconds - x)))
+    Closest_points_diff <- abs(Sequence_time_seconds - track_data$time_seconds[Closest_points])
+    
+    # Mark "closest" points that are more than 1.5 minutes away as NA
+    Closest_points[Closest_points_diff > 90] <- NA
+    
+    # Select points that are within 1.5 minutes of the sequence times
+    Closest_points_to_merge <- which(Closest_points_diff <= 90)
+    
+    # Use closest points directly where possible
+    data_select <- track_data[Closest_points[Closest_points_to_merge], ]
+    
+    # store outcome
+    data_select_list[[track_id]] <- data_select
+    sequence_time_list[[track_id]] <- Sequence_time
+    closest_points_list[[track_id]] <- Closest_points
+  }
+  
+  return(list(data_select_list = data_select_list, sequence_time_list = sequence_time_list, closest_points_list = closest_points_list))
+}
+```
+
+```{r}
+# Function to interpolate missing sequence points for all tracks
+interpolate_intervals_per_track <- function(datasea) {
+  
+  # Apply sequence generation function for each track
+  interval_data <- generate_time_sequence(datasea)
+  data_select_list <- interval_data$data_select_list
+  sequence_time_list <- interval_data$sequence_time_list
+  closest_points_list <- interval_data$closest_points_list
+  
+  # Combine all data_select and sequence_time from the lists
+  data_select <- do.call(rbind, data_select_list)
+  sequence_time <- do.call(c, sequence_time_list)
+  closest_points <- do.call(c, closest_points_list)
+  
+  # Find which sequence times do not have a close enough point (NA in closest_points)
+  predTimes <- sequence_time[is.na(closest_points)]
+  
+  # interpolate data for missing sequence points using CrawlWrap
+  if (length(predTimes) > 0) {
+    
+    interpolated_data <- crawlWrap(datasea, predTime = predTimes) # use CrawlWrap
+    interpolated_data <- interpolated_data$crwPredict #extract interpolated data
+    
+    # match interpolated dataset to already selected data
+    selected_interpolated_data <- as.data.frame(interpolated_data[,3:32])
+    selected_interpolated_data$x <- interpolated_data$mu.x
+    selected_interpolated_data$y <- interpolated_data$mu.y
+    selected_interpolated_data$time_seconds <- rep(NA, nrow(selected_interpolated_data))
+    
+    # Add corresponding track_ID to interpolated data
+    selected_interpolated_data$track_ID <- sapply(selected_interpolated_data$time, function(t) {
+      # Find the corresponding track_ID based on the nearest time in datasea
+      closest_time <- which.min(abs(as.numeric(datasea$time) - as.numeric(t)))
+      datasea$track_ID[closest_time]
+    })
+    
+    # Combine data: replace missing points with interpolated data
+    selected_interpolated_data <- selected_interpolated_data[selected_interpolated_data$time %in% predTimes, ]
+    final_data <- rbind(data_select, selected_interpolated_data)
+    
+    } else {
+    
+    final_data <- data_select
+  }
+  
+  # Sort resulting dataframe by time
+  final_data <- arrange(final_data, time)
+  
+  print("interpolate_intervals_per_track done!")
+  return(final_data)
+}
+
+```
+
+# Main script to load data, process it, and save the final dataset
+```{r}
+# Main script to load data, process it, and save the final dataset
+
+# download land and lakes data from the 'naturalearthdata.com' website
+Land <- ne_download(category = 'physical', type = 'land', scale = 'large')
+Lakes <- ne_download(category = 'physical', type = 'lakes', scale = 'large') |> sf::st_make_valid()
+
+# List all files in the directory containing your  datasets
+file_list <- list.files(path = "data_raw", pattern = ".csv", full.names = TRUE)
+
+for (i in 1:x) { #loop over the number of files
+
+  tryCatch({ #in case crawlWrap "fails for all individuals"
+    
+    # Load and prepare data
+    filepath <- file_list[i]
+    data <- read_and_prep_data(filepath)
+    data <- convert_to_utm(data)
+
+    # Filter data points above sea and clean tracks
+    datasea <- sea_datapoints(data)
+    datasea <- clean_tracks(datasea)
+
+    # Interpolate intervals using the predicted data and create final dataset
+    final_dataset <- interpolate_intervals_per_track(datasea)
+      #CrawlWrap sometimes fails "for all individuals", usually running this line again works
+
+    # Create output file path
+    base_name <- tools::file_path_sans_ext(basename(filepath))
+    output_file <- file.path("preprocessed_data", paste0(base_name, "_preprocessed.csv"))
+    
+    # Save the final processed dataset
+    write.csv(final_dataset, output_file, row.names = FALSE)
+    print(paste("Saved:", output_file))
+
+    }, error = function(e) {
+    
+      # Print error message and continue with the next item
+    print(paste("Error processing", filepath, ":", e$message))
+  
+      })
+
+}
+
+```
+
+# can be used to identify which files failed and need to be processed again
+```{r}
+folder1 <- "preprocessed_data"
+folder2 <- "HMM_processed_data"
+
+# List the files in each folder
+files1 <- list.files(folder1, full.names = TRUE)
+files2 <- list.files(folder2, full.names = TRUE)
+
+# Extract the numeric parts of the filenames
+extract_numbers <- function(filenames) {
+  gsub(".*_(\\d+).*", "\\1", basename(filenames))
+}
+
+numbers1 <- extract_numbers(files1)
+numbers2 <- extract_numbers(files2)
+
+# Create sets of filenames for comparison
+set1 <- unique(numbers1)
+set2 <- unique(numbers2)
+
+# Find numeric parts only in the first folder
+only_in_folder1_numbers <- setdiff(set1, set2)
+
+# Find file names in folder1 that have these numeric parts
+files_only_in_folder1 <- files1[extract_numbers(files1) %in% only_in_folder1_numbers]
+
+```

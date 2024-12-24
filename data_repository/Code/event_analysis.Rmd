@@ -1,0 +1,520 @@
+---
+title: "Event analysis"
+output: html_notebook
+---
+This file contains functions and a main script that can be used to:
+
+  1. Summarize boat event data, including event duration, spatial center, and event types.
+  2. Generate exploratory visualizations for events, including temporal trends (e.g., monthly,         yearly) and spatial distribution (e.g., global maps).
+  3. Merge event data with additional metadata (e.g., bird sex) for enhanced analyses.
+  4. Fit statistical models to analyze temporal and spatial patterns, including GLMs and LMMs.
+
+Additional metadata files are required for merging, such as calculating effort measures used in the statistical analyses.
+
+```{r}
+# read in data
+dataset <- all_boat_events
+```
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+if (!require("rnaturalearth")) devtools::install_github("ropensci/rnaturalearth")
+library(rnaturalearth)
+library(sf)
+library(geosphere)
+library(emmeans)
+library(lme4)
+```
+
+# create a data summary dataframe
+```{r}
+# creating a summary of detected events using the all_boat_events dataframe
+event_summary_df <- dataset %>%
+  group_by(device, event_id) %>%
+  summarise(
+    start_time = min(time),                  # First time of the event
+    end_time = max(time),                    # Last time of the event
+    event_duration = difftime(max(time), min(time), units = "mins"),  # Event duration
+    year = year(min(time)),                  # Extract year from start_time
+    month = month(min(time)),                # Extract month from start_time
+    weekday = wday(min(time), label = TRUE), # Extract weekday from start_time
+    center_x = mean(x, na.rm = TRUE),        # Calculate center of x (UTME)
+    center_y = mean(y, na.rm = TRUE),        # Calculate center of y (UTMN)
+    event_type = case_when(                  # Determine event type based on 'States'
+      sum(States == "Trawler") > sum(States == "Shrimp boat") ~ "Trawler",
+      sum(States == "Trawler") == sum(States == "Shrimp boat") ~ "Trawler",
+      sum(States == "Shrimp boat") > sum(States == "Trawler") ~ "Shrimp boat",
+    )
+  ) %>%
+  ungroup()  # Always ungroup after summarise
+
+```
+
+# factorize the month and weekday variables
+```{r}
+# Create a factor for the month with all 12 months as levels
+event_summary_df$month <- factor(event_summary_df$month, levels = 1:12, 
+                                 labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))
+# Convert weekday to a factor with levels in the desired order
+event_summary_df$weekday <- factor(event_summary_df$weekday, 
+                                    levels = c("Mon", "Tue", "Wed", 
+                                               "Thu", "Fri", "Sat", "Sun"))
+```
+
+# plot number of events per month
+```{r}
+# Barplot of events per month, showing all months
+ggplot(event_summary_df, aes(x = month)) +
+  geom_bar(fill = "steelblue") +
+  scale_x_discrete(drop = FALSE) +  # Ensure no months are dropped
+  labs(
+    x = "Month",
+    y = "Number of Events"
+  ) + theme(
+  axis.text.x = element_text(size = 14),  # Increase x-axis text size
+  axis.text.y = element_text(size = 14),  # Increase y-axis text size
+  axis.title.x = element_text(size = 16),                 # Change size of x-axis title
+  axis.title.y = element_text(size = 16),                 # Change size of y-axis title
+)
+
+```
+
+# plot number of events per year
+```{r}
+# Barplot of events per year, stacked by event_type
+ggplot(event_summary_df, aes(x = factor(year))) +
+  geom_bar(fill = "darkred") +
+  labs(
+    x = "Year",
+    y = "Number of Events",
+    fill = "Event Type"
+  ) + theme(
+  axis.text.x = element_text(size = 14),  # Increase x-axis text size
+  axis.text.y = element_text(size = 14),  # Increase y-axis text size
+  axis.title.x = element_text(size = 16),                 # Change size of x-axis title
+  axis.title.y = element_text(size = 16),                 # Change size of y-axis title
+)
+```
+
+# plot number of events per day of the week
+```{r}
+# Barplot of events per weekday
+ggplot(event_summary_df, aes(x = weekday)) +
+  geom_bar(fill = "darkorange") +
+  labs(
+    x = "Weekday",
+    y = "Number of Events"
+  ) + theme(
+    axis.text.x = element_text(size = 14),  # Increase x-axis text size
+    axis.text.y = element_text(size = 14),  # Increase y-axis text size
+    axis.title.x = element_text(size = 16),  # Change size of x-axis title
+    axis.title.y = element_text(size = 16)   # Change size of y-axis title
+  )
+
+```
+
+# determine the locations of the detected events and plot on a map
+```{r}
+# Download land and lakes data using rnaturalearth
+Land <- ne_download(category = 'physical', type = 'land', scale = 'large')
+Lakes <- ne_download(category = 'physical', type = 'lakes', scale = 'large') |> sf::st_make_valid()
+
+# Ensure event_summary_df contains the UTM zone by retrieving non-NA UTMzone from the dataset
+utm_zones_summary <- dataset %>%
+  group_by(device, event_id) %>%
+  summarize(UTMzone = first(UTMzone[!is.na(UTMzone)])) %>%
+  ungroup()
+
+# Merge the UTMzone back into event_summary_df
+event_summary_df <- event_summary_df %>%
+  left_join(utm_zones_summary, by = c("device", "event_id"))
+
+# Make a copy of the original data
+event_summary_with_latlong <- event_summary_df
+
+# Filter only the rows with valid UTMzone, center_x, and center_y
+rows_to_convert <- event_summary_with_latlong %>%
+  filter(!is.na(UTMzone) & !is.na(center_x) & !is.na(center_y))
+
+# Function to convert UTM to lat/long based on UTM zone
+convert_utm_to_latlong <- function(df) {
+  
+  unique_zones <- unique(df$UTMzone)
+  
+  # Initialize an empty list to hold converted data
+  converted_list <- list()
+  
+  # Loop through each unique UTM zone
+  for (zone in unique_zones) {
+    # Filter data for the current zone
+    df_zone <- df %>% filter(UTMzone == zone)
+    
+    # Ensure UTM zone is a character string and handle both Northern and Southern Hemisphere
+    hemisphere_suffix <- ifelse(as.numeric(zone) < 0, "+south", "")
+    
+    # Define the UTM CRS based on the current zone
+    utm_crs <- paste0("+proj=utm +zone=", abs(as.numeric(zone)), " +datum=WGS84 ", hemisphere_suffix)
+    
+    # Convert to sf object and assign CRS
+    df_zone_sf <- df_zone %>%
+      st_as_sf(coords = c("center_x", "center_y"), crs = utm_crs) %>%
+      st_transform(crs = "+proj=longlat +datum=WGS84")  # Convert to lat/long
+    
+    # Extract the transformed coordinates
+    df_zone_sf <- df_zone_sf %>%
+      mutate(
+        longitude = st_coordinates(.)[, 1],
+        latitude = st_coordinates(.)[, 2]
+      )
+    
+    # Append to the list
+    converted_list[[as.character(zone)]] <- df_zone_sf
+  }
+  
+  # Combine all converted data back into a single dataframe
+  return(bind_rows(converted_list))
+}
+
+# Apply the function to convert UTM coordinates to lat/long only for the valid rows
+if(nrow(rows_to_convert) > 0) {  # Ensure there is data to convert
+  converted_data <- convert_utm_to_latlong(rows_to_convert)
+  
+  # Add the converted latitude and longitude back to the original data
+  event_summary_with_latlong <- event_summary_with_latlong %>%
+    left_join(
+      converted_data %>% select(device, event_id, longitude, latitude),
+      by = c("device", "event_id")
+    )
+  
+  # Plot using ggplot2 (entire world) for rows that have been converted
+  p <- ggplot() +
+    geom_sf(data = Land, fill = "lightgray", color = NA) +
+    geom_sf(data = Lakes, fill = "white", color = "blue") +
+    geom_point(data = event_summary_with_latlong %>% filter(!is.na(longitude) & !is.na(latitude)), 
+               aes(x = longitude, y = latitude, color = event_type), size = 2, shape = 19) +
+    scale_color_manual(values = c("Trawler" = "blue", "Shrimp boat" = "green", "Unknown" = "red")) +
+    labs(title = "Event Locations on Map", x = "Longitude", y = "Latitude", color = "Event Type") +
+    theme_minimal()
+  
+  print(p)
+  
+  # Plot focusing on region where points occur
+  lon_range <- range(event_summary_with_latlong$longitude, na.rm = TRUE)
+  lat_range <- range(event_summary_with_latlong$latitude, na.rm = TRUE)
+  lon_buffer <- diff(lon_range) * 0.1
+  lat_buffer <- diff(lat_range) * 0.1
+  xlim <- c(lon_range[1] - lon_buffer, lon_range[2] + lon_buffer)
+  ylim <- c(lat_range[1] - lat_buffer, lat_range[2] + lat_buffer)
+  
+  p <- ggplot() +
+    geom_sf(data = Land, fill = "lightgray", color = NA) +
+    geom_sf(data = Lakes, fill = "white", color = NA) +
+    geom_point(data = event_summary_with_latlong %>% filter(!is.na(longitude) & !is.na(latitude)), 
+               aes(x = longitude, y = latitude, color = event_type), size = 2, shape = 19) +
+    scale_color_manual(values = c("Trawler" = "steelblue", "Shrimp boat" = "darkorange")) +
+    coord_sf(xlim = xlim, ylim = ylim) +
+    labs(title = "Event Locations on Map", x = "Longitude", y = "Latitude", color = "Event Type") +
+    theme_minimal()
+  
+  print(p)
+  
+  # Plotting events only in the North and Wadden Sea
+  lon_range <- c(2, 6)
+  lat_range <- c(52, 54)
+  
+  lon_buffer <- diff(lon_range) * 0.1
+  lat_buffer <- diff(lat_range) * 0.1
+  xlim <- c(lon_range[1] - lon_buffer, lon_range[2] + lon_buffer)
+  ylim <- c(lat_range[1] - lat_buffer, lat_range[2] + lat_buffer)
+  
+  p <- ggplot() +
+    geom_sf(data = Land, fill = "lightgray", color = NA) +
+    geom_sf(data = Lakes, fill = "white", color = NA) +
+    geom_point(data = event_summary_with_latlong %>% filter(!is.na(longitude) & !is.na(latitude)), 
+               aes(x = longitude, y = latitude, color = event_type), size = 2, shape = 19) +
+    scale_color_manual(values = c("Trawler" = "steelblue", "Shrimp boat" = "darkorange")) +
+    coord_sf(xlim = xlim, ylim = ylim) +  # Focus the map on the region with points
+    labs(title = "Event Locations on Map", x = "Longitude", y = "Latitude", color = "Event Type") +
+    theme_minimal()
+  
+  print(p)
+  
+} else {
+  message("No valid data to plot after filtering out rows with missing UTMzone or coordinates.")
+}
+```
+
+#calculate the distance of the event centre from the colony
+```{r}
+# Assign longitude and latitude from event_summary_with_latlong to event_summary_df
+event_summary_df$longitude <- event_summary_with_latlong$longitude
+event_summary_df$latitude <- event_summary_with_latlong$latitude
+
+# Colony coordinates for Kelderhuispolder, Texel, Netherlands
+colony_lat <- 53.059444  # Latitude
+colony_lon <- 4.817222   # Longitude
+
+# Calculate the distance using the Haversine formula, handling NA values
+event_summary_df <- event_summary_df %>%
+  mutate(
+    distance_to_colony = ifelse(
+      !is.na(longitude) & !is.na(latitude),
+      distHaversine(cbind(longitude, latitude), c(colony_lon, colony_lat)) / 1000,  # Distance in kilometers
+      NA  # Assign NA if lat/long is missing
+    )
+  )
+```
+
+# include info on gulls coupled to device IDs
+```{r}
+# create new dataframe with information
+gull_info <- event_summary_df %>%
+  group_by(device) %>%         # Group by the 'device' column
+  summarise(n_events = n()) %>% # Count the number of events for each device
+  ungroup()                    # Ungroup to remove the grouping structure
+
+# vector with info
+gull_info$sex <- c("MM", "FF", "FF", "MM", "FF", "MM", "FF", "MM", "FF", "MM", "FF", "MM", "MM", "MM", "MM", "MM", "MM", "FF", "FF", "MM", "FF", "MM", "MM", "MM", "MM", "MM", "MM", "FF", "MM", "FF", "FF", "MM", "MM", "MM", "MM", "MM", "MM", "MM", "MM", "MM", "MM", "FF", "FF", "MM", "FF", "FF", "MM", "FF", "FF", "MM", "FF", "MM", "FF", "MM", "MM")
+
+# Merge event_summary_df with gull_info based on the "device" column
+event_summary_df <- merge(event_summary_df, gull_info[, c("device", "sex")], by = "device", all.x = TRUE)
+```
+
+# GLM analysis of number of events per year
+```{r}
+# Specify the folder containing your GPS data files
+folder_path <- "HMM_processed_data"
+
+# List all files in the folder (assuming they are CSVs)
+file_list <- list.files(folder_path, full.names = TRUE, pattern = ".csv")
+
+# Initialize an empty dataframe to store the combined data
+combined_gps_data <- data.frame()
+
+# Loop through each file and read it into the combined dataframe
+for (file in file_list) {
+  # Read the current file
+  gps_data <- read.csv(file)
+  gps_data[,3:32] <- as.character(gps_data[,3:32])
+  
+  # Combine with the main dataframe
+  combined_gps_data <- bind_rows(combined_gps_data, gps_data)
+}
+
+# Assuming 'time' column is in datetime format; if not, convert it
+combined_gps_data$time <- as.POSIXct(combined_gps_data$time, tz = "UTC")
+
+# Extract the year from the 'time' column
+combined_gps_data <- combined_gps_data %>%
+  mutate(year = year(time))
+
+# Calculate the effort per year (number of GPS points)
+effort_df <- combined_gps_data %>%
+  group_by(year) %>%
+  summarise(effort = n())  # 'n()' counts the number of GPS points per year
+
+# Merge the effort data with the event summary dataframe
+event_summary_df <- event_summary_df %>%
+  left_join(effort_df, by = "year")
+
+# Calculate number of unique events per year
+n_events_per_year <- event_summary_df %>%
+  group_by(year) %>%
+  summarise(n_events = n_distinct(event_id))  # Count unique event IDs per year
+
+# Merge n_events with event_summary_df
+event_summary_df <- event_summary_df %>%
+  left_join(n_events_per_year, by = "year")
+
+poisson_data <- data.frame("year" = c(2015:2022), "n_events" = c(15, 92, 57, 56, 62, 67, 67, 35), "effort" = c(125760, 245003, 334094, 313014, 414936, 529679, 479343, 421489))
+
+# Calculate the mean and variance of the event counts (n_events)
+mean_n_events <- mean(poisson_data$n_events)
+variance_n_events <- var(poisson_data$n_events)
+
+# Print the values
+mean_n_events
+variance_n_events
+
+# Fit the Poisson regression model
+model <- glm(n_events ~ year + offset(log(effort)), family = poisson, data = poisson_data)
+
+# Get the deviance residuals
+residuals <- residuals(model, type = "deviance")
+
+# Plot residuals vs. the predictor (year) to check for linearity
+plot(poisson_data$year, residuals, main = "Deviance Residuals vs Year",
+     xlab = "Year", ylab = "Deviance Residuals")
+abline(h = 0, col = "red", lty = 2)
+
+#switch to quasi Poisson to account for overdispersion
+quasi_model <- glm(n_events ~ year * event_type + offset(log(effort)), 
+                   family = quasipoisson, data = event_summary_df)
+
+# View the summary of the model
+summary(quasi_model)
+
+```
+
+# statistical analysis of distance of event from colony
+```{r}
+# Fit a linear mixed model
+model <- lmer(distance_to_colony ~ year + event_type + month + sex + weekday + (1|device), 
+              data = event_summary_df)
+
+# View the summary of the model
+summary(model)
+
+model2 <- lmer(distance_to_colony ~ year + event_type + month + sex + factor(weekday) + (1 | device), 
+               data = event_summary_df)
+
+summary(model2)
+
+# Residuals vs. Fitted plot
+plot(model2)
+
+# Q-Q plot for residuals
+qqnorm(resid(model2))
+qqline(resid(model2))
+
+# library(car)
+vif(model2)
+
+# Post-hoc comparisons for event_type
+emmeans(model2, pairwise ~ event_type)
+
+# # Plot residuals by groups to identify the source of heteroscedasticity
+# boxplot(resid(model) ~ event_summary_df$event_type)
+# boxplot(resid(model) ~ event_summary_df$sex)
+# plot(resid(model) ~ event_summary_df$year)
+# plot(resid(model) ~ event_summary_df$weekday)
+
+emmeans(model2, ~ weekday)
+contrast(emmeans(model2, ~ weekday), method = "pairwise")
+
+emmeans(model2, ~ month)
+contrast(emmeans(model2, ~ month), method = "pairwise")
+```
+
+# grouped weekdays, for the whole year
+```{r}
+# Create the grouped_days variable
+event_summary_df <- event_summary_df %>%
+  mutate(grouped_days = case_when(
+    weekday %in% c("Mon", "Tue", "Wed", "Thu", "Fri" ) ~ "fishing_days",
+    weekday %in% c("Sat", "Sun") ~ "weekend_days",
+    TRUE ~ NA_character_
+  ))
+
+# Convert grouped_days to a factor to ensure it's treated as categorical
+event_summary_df$grouped_days <- factor(event_summary_df$grouped_days)
+
+# Fit the model with the grouped_days variable
+model2 <- lmer(distance_to_colony ~ year + event_type + month + sex + grouped_days + (1 | device), 
+               data = event_summary_df)
+
+# Summary of the new model
+summary(model2)
+
+plot(model2)
+qqnorm(resid(model2))
+qqline(resid(model2))
+vif(model2)
+
+# Pairwise comparisons for grouped_days
+emmeans(model2, pairwise ~ grouped_days)
+
+# For month
+emmeans(model2, ~ month)
+contrast(emmeans(model2, ~ month), method = "pairwise")
+
+# For event_type
+emmeans(model2, pairwise ~ event_type)
+```
+
+# analysis of grouped weekdays only for summer months
+```{r}
+# Filter for specific months
+filtered_data <- event_summary_df %>%
+  filter(month %in% c("Apr", "May", "Jun", "Jul", "Aug"))
+
+# Fit the model with filtered data
+model_filtered <- lmer(distance_to_colony ~ year + event_type + sex + grouped_days + (1 | device), 
+                       data = filtered_data)
+
+# View the summary of the filtered model
+summary(model_filtered)
+
+# check assumptions
+plot(model_filtered)
+qqnorm(resid(model_filtered))
+qqline(resid(model_filtered))
+vif(model_filtered)
+
+# Pairwise comparisons for grouped_days
+emmeans(model_filtered, pairwise ~ grouped_days)
+
+# Pairwise comparisons for event_type
+emmeans(model_filtered, pairwise ~ event_type)
+
+```
+
+# check whether multiple events are detected at the same location at the same time
+```{r}
+# Define thresholds
+time_threshold_minutes <- 30 # time difference threshold in minutes
+spatial_threshold_km <- 2  # spatial distance threshold in kilometers
+
+# Create a function to check time overlap
+check_time_overlap <- function(start1, end1, start2, end2, threshold) {
+  # Calculate the time difference in minutes
+  overlap <- max(difftime(start2, end1, units = "mins"), difftime(start1, end2, units = "mins"))
+  return(abs(overlap) <= threshold)
+}
+
+# Create an empty list to store overlapping event pairs
+overlapping_events <- list()
+
+# Compare each event with every other event
+for (i in 1:(nrow(event_summary_df) - 1)) {
+  for (j in (i + 1):nrow(event_summary_df)) {
+    
+    # Check time overlap
+    start_time_i <- event_summary_df$start_time[i]
+    end_time_i <- event_summary_df$end_time[i]
+    start_time_j <- event_summary_df$start_time[j]
+    end_time_j <- event_summary_df$end_time[j]
+    
+    time_overlap <- check_time_overlap(start_time_i, end_time_i, start_time_j, end_time_j, time_threshold_minutes)
+    
+    if (!time_overlap) next  # Skip if no time overlap
+    
+    # Check spatial proximity
+    loc_i <- c(event_summary_df$longitude[i], event_summary_df$latitude[i])
+    loc_j <- c(event_summary_df$longitude[j], event_summary_df$latitude[j])
+    distance_km <- distHaversine(loc_i, loc_j) / 1000  # Convert meters to kilometers
+    
+    if (distance_km <= spatial_threshold_km) {
+      overlapping_events <- append(overlapping_events, list(c(i, j)))
+    }
+  }
+}
+
+# Display results
+if (length(overlapping_events) > 0) {
+  print("Overlapping events found:")
+  print(overlapping_events)
+} else {
+  print("No overlapping events found.")
+}
+
+```
+
+# store summary results
+```{r}
+write.csv(event_summary_df, "event_summary_df.csv", row.names = FALSE)
+```

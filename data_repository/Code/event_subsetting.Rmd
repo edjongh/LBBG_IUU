@@ -1,0 +1,361 @@
+---
+title: "Event subsetting"
+output: html_notebook
+---
+
+This file contains functions and a main script that can be used to:
+  1. Extract GPS track segments associated with specific behaviors using HMM states.
+  2. Identify GPS track segments with movement patterns indicative of "boat events" (e.g.,             back-and-forth movement).
+  3. Compare detected boat events to known events to assess detection recall.
+  4. Visualize selected GPS track segments for precision evaluation.
+
+The input CSV file should have the following columns:
+1. time (POSIXct): Timestamp of each data point in the format "YYYY-MM-DD HH:MM:SS".
+2. States (string): Behavior state associated with the data point (e.g., "Trawler").
+3. x (numeric): UTM X-coordinate of the data point.
+4. y (numeric): UTM Y-coordinate of the data point.
+
+An additional file with pre-selected events is necessary for the recall evaluation along with the event_summary_df which can be created using event_analysis.Rmd
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+```
+
+# extract GPS track segments with specific HMM states labels
+```{r}
+filter_states <- function(gps_data) {
+
+  # Filter the dataset to include only boat points (state 6)
+  boat_data <- gps_data %>% filter(States %in% c("Trawler", "Shrimp boat", "Exploratory Flight"))
+
+  # Sort the data by time
+  boat_data <- boat_data %>% arrange(time)
+  boat_data <- boat_data[!is.na(boat_data$time), ]
+  
+  # Initialize the event ID
+  boat_data$event_id <- 1
+
+  # Loop through the boat_data to assign event IDs
+  for (i in 2:nrow(boat_data)) {
+    
+    # Calculate the time difference between consecutive points
+    time_diff <- difftime(boat_data$time[i], boat_data$time[i - 1], units = "mins")
+    
+    # If the time difference is greater than 30 minutes, increment the event ID
+    if (time_diff > 30) {
+      boat_data$event_id[i] <- boat_data$event_id[i - 1] + 1
+    } else {
+      boat_data$event_id[i] <- boat_data$event_id[i - 1]
+    }
+  }
+  
+  # Extract the event IDs with their corresponding time ranges
+  event_ranges <- boat_data %>%
+    group_by(event_id) %>%
+    summarize(start_time = min(time), end_time = max(time))
+  
+  # Initialize the event ID column for the full dataset
+  gps_data$event_id <- NA
+  
+  # Loop through each event range and label the points in the full dataset
+  for (i in 1:nrow(event_ranges)) {
+    gps_data$event_id[gps_data$time >= event_ranges$start_time[i] & gps_data$time <= event_ranges$end_time[i]] <- event_ranges$event_id[i]
+  }
+  
+  # Filter out boat events with fewer than 4 boat points
+  valid_event_ids <- boat_data %>%
+    group_by(event_id) %>%
+    filter(n() >= 6) %>%
+    pull(event_id) %>%
+    unique()
+  
+  boat_data_filtered <- gps_data %>%
+    filter(event_id %in% valid_event_ids)
+
+  return(boat_data_filtered)
+}
+
+```
+
+# identify GPS track segments with a back and forth movement pattern in them
+```{r}
+extract_boat_events <- function(boat_data_filtered) {
+  # Initialize a column to store if the event is a "boat event" based on distance
+  boat_data_filtered$is_boat_event <- FALSE
+  
+  # Function to calculate Euclidean distance between two UTM points
+  euclidean_distance <- function(x1, y1, x2, y2) {
+    sqrt((x2 - x1)^2 + (y2 - y1)^2)
+  }
+  
+  unique_events <- unique(boat_data_filtered$event_id)
+  
+  # Loop through each event
+  for (id in unique_events) {
+    
+    # Extract the event data for this event_id, excluding rows with NA coordinates
+    event_data <- boat_data_filtered %>%
+      filter(event_id == id & !is.na(x) & !is.na(y))
+    
+    # Skip if event_data is empty
+    if (nrow(event_data) == 0) {
+      next
+    }
+    
+    # Calculate the actual traveled distance (along the whole track)
+    total_traveled_distance <- 0
+    for (i in 2:nrow(event_data)) {
+      total_traveled_distance <- total_traveled_distance + euclidean_distance(
+        event_data$x[i-1], event_data$y[i-1], event_data$x[i], event_data$y[i]
+      )
+    }
+    
+    # Calculate the convex hull and the absolute distance (size of the track in space)
+    coords <- as.matrix(event_data[, c("x", "y")])
+    if (nrow(coords) > 2) {  # Ensure there are enough points to form a hull
+      hull <- chull(coords)  # Convex hull indices
+      hull_coords <- coords[hull, ]  # Convex hull coordinates
+      
+      # Calculate the perimeter of the convex hull
+      hull_perimeter <- 0
+      for (i in 2:nrow(hull_coords)) {
+        hull_perimeter <- hull_perimeter + euclidean_distance(
+          hull_coords[i-1, 1], hull_coords[i-1, 2], hull_coords[i, 1], hull_coords[i, 2]
+        )
+      }
+      
+      # Close the convex hull loop (distance between the last and first points)
+      hull_perimeter <- hull_perimeter + euclidean_distance(
+        hull_coords[nrow(hull_coords), 1], hull_coords[nrow(hull_coords), 2], hull_coords[1, 1], hull_coords[1, 2]
+      )
+      
+      # Compare actual traveled distance to the convex hull size
+      if (total_traveled_distance > 1.3 * hull_perimeter) {
+        boat_data_filtered$is_boat_event[boat_data_filtered$event_id == id] <- TRUE
+      }
+    }
+  }
+
+  selected_events <- boat_data_filtered %>% filter(is_boat_event == TRUE)
+  return(selected_events)
+}
+```
+
+# run functions on GPS data to extract boat events
+```{r}
+# create link to data files
+file_list <- list.files(path = "HMM_processed_data", pattern = ".csv", full.names = TRUE)
+
+all_boat_events <- data.frame() # store selected GPS track segments
+failed_files <- c() # store files that can't be processed
+
+# function call
+for (i in 1:length(file_list)){
+  
+  tryCatch({
+  
+    # read in data
+    gps_data <- read.csv(file_list[i])
+    gps_data$time <- as.POSIXct(gps_data$time, tz = "UTC", format = "%Y-%m-%d %H:%M:%S")
+    
+    # Ensure data format is similar across files and filter NA values
+    gps_data[,3:23] <- as.character(gps_data[,3:23])
+    event_data <- filter_states(gps_data)
+    
+    # extract GPS track segments
+    selected_events <- extract_boat_events(event_data)
+    
+    if (nrow(selected_events) > 0){
+      all_boat_events <- bind_rows(all_boat_events, selected_events)
+      
+      print(paste("Done with", file_list[i]))
+    } else {
+      print(paste("No events for", file_list[i]))
+    }
+  
+  }, error = function(e) {
+    # Print error message and continue with the next item
+    print(paste("Error processing", file_list[i], ":", e$message))
+  })
+
+}
+
+# check number of unique events
+count_combinations <- n_distinct(all_boat_events$device, all_boat_events$event_id)
+
+# save selected data
+write.csv(all_boat_events, "all_boat_events.csv", row.names = FALSE)
+```
+
+# check detection recall
+```{r}
+# Function to check if two time intervals overlap
+time_overlap <- function(start1, end1, start2, end2) {
+  return(start1 <= end2 & end1 >= start2)
+}
+
+# Function to check for overlaps between boat events and event summary, and log NA cases
+check_event_overlap <- function(boat_events, event_summary_df) {
+  
+  # Add new columns to store the result (TRUE if overlap found, FALSE otherwise)
+  boat_events$overlap <- FALSE
+  event_summary_df$overlap <- FALSE
+  
+  # Add a column to store the Event nr. from boat_events for which the event overlaps
+  event_summary_df$boat_event_nr <- NA
+  
+  # Create data frames to store cases where NA was found
+  na_boat_events <- data.frame()
+  na_matching_events <- data.frame()
+  
+  # Loop through each event in boat_events
+  for (i in 1:nrow(boat_events)) {
+    
+    # Extract Device ID, Start time, End time, and Event nr. from the boat event
+    device_id_boat <- boat_events$`Device ID`[i]
+    start_time_boat <- as.POSIXct(boat_events$`Start time`[i], format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+    end_time_boat <- as.POSIXct(boat_events$`End time`[i], format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+    event_nr_boat <- boat_events$`Event nr.`[i]  # Extract the Event nr.
+    
+    # Check if boat event times are NA and log them
+    if (is.na(start_time_boat) | is.na(end_time_boat)) {
+      na_boat_events <- rbind(na_boat_events, boat_events[i, ])
+      next  # Skip this boat event if start or end time is NA
+    }
+    
+    # Filter event_summary_df for the same Device ID
+    matching_events <- event_summary_df[event_summary_df$device == device_id_boat, ]
+    
+    # Check if matching_events is empty
+    if (nrow(matching_events) == 0) {
+      next  # Skip to the next boat event if no matching events found
+    }
+    
+    # Check if there is any overlap with any event in the filtered event_summary_df
+    for (j in 1:nrow(matching_events)) {
+      
+      start_time_summary <- as.POSIXct(matching_events$start_time[j], format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+      end_time_summary <- as.POSIXct(matching_events$end_time[j], format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+      
+      # Check if summary times are NA and log them
+      if (is.na(start_time_summary) | is.na(end_time_summary)) {
+        na_matching_events <- rbind(na_matching_events, matching_events[j, ])
+        next  # Skip this matching event if start or end time is NA
+      }
+      
+      # Check if times overlap using the custom function
+      if (time_overlap(start_time_boat, end_time_boat, start_time_summary, end_time_summary)) {
+        # Mark overlap in boat_events
+        boat_events$overlap[i] <- TRUE  
+        
+        # Mark overlap in event_summary_df
+        match_index <- which(event_summary_df$device == device_id_boat & 
+                             event_summary_df$start_time == matching_events$start_time[j] & 
+                             event_summary_df$end_time == matching_events$end_time[j])
+                             
+        event_summary_df$overlap[match_index] <- TRUE
+        event_summary_df$boat_event_nr[match_index] <- event_nr_boat  # Add the Event nr. to the matching event
+        
+        break  # If overlap found, stop checking further events for this boat event
+      }
+    }
+  }
+  
+  # Return the result and NA cases
+  return(list(boat_events_overlap = boat_events, event_summary_overlap = event_summary_df, 
+              na_boat_events = na_boat_events, na_matching_events = na_matching_events))
+}
+
+# Example usage of the function
+result <- check_event_overlap(boat_events_hand_picked, event_summary_df)
+
+# Get the boat events with overlap
+boat_events_with_overlap <- result$boat_events_overlap
+event_summary_with_overlap <- result$event_summary_overlap
+
+table(boat_events_with_overlap$overlap)
+```
+
+# visually check detection and classification precision
+```{r}
+plot_selected_events <- function(gps_track, selected_events) {
+  
+  # Extract device ID from GPS track data
+  device_ID <- as.numeric(gps_track$device[1])
+  
+  # Filter the selected events to only include events for the current device
+  df_events <- selected_events[!is.na(selected_events$device) & selected_events$device == device_ID, ]
+  
+  # Convert the time column in GPS data to POSIXct format for later filtering
+  gps_track$time <- as.POSIXct(gps_track$time, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  
+  # Check if there are any relevant events for the current device
+  if (nrow(df_events) == 0) {
+    print(paste("No selected events for device", device_ID))
+  
+  } else {
+    
+    # Define the state names for different behaviors or activities
+    state_names <- c("Stationary", "Float", "ARS", "Exploratory Flight", "Transit", "Trawler", "Shrimp boat")
+    
+    # Define a named vector for colors corresponding to the states
+    state_colors <- c("Stationary" = "red", "Float" = "blue", "ARS" = "green",
+                      "Exploratory Flight" = "purple", "Transit" = "orange",
+                      "Trawler" = "brown", "Shrimp boat" = "pink")
+    
+    # Loop through each selected event for the current device
+    for (i in 1:nrow(df_events)) {
+      
+      # Extract start and end times for the current event
+      start_time <- as.POSIXct(df_events$start_time[i], tz = "UTC")
+      end_time <- as.POSIXct(df_events$end_time[i], tz = "UTC")
+      
+      # Filter GPS data to include only points within the event time range
+      filtered_data <- gps_track %>% filter(time >= start_time & time <= end_time)
+      
+      # Check if filtered_data has any points to plot
+      if (nrow(filtered_data) > 0) {
+        # Create the plot for the current event
+        p <- ggplot(filtered_data, aes(x = x, y = y, color = States)) +
+          geom_point() +
+          scale_color_manual(values = state_colors) + # Use custom colors for states
+          labs(title = paste("Track/Point Plot", device_ID, "- Event", df_events$event_id[i], "duration", as.numeric(df_events$event_duration[i]) / 60), # Add event index to the title
+               x = "X Coordinate",
+               y = "Y Coordinate",
+               color = "States") +
+          geom_segment(aes(xend = lead(x), yend = lead(y)), arrow = arrow(length = unit(0.2, "cm"))) + 
+          theme_minimal()
+        
+        # Print plot
+        print(p)
+      } else {
+        print(paste("No GPS points in the range for event", i, "for device", device_ID))
+      }
+    }
+  }
+}
+
+
+# Randomly select 50 numbers from 1 to 463
+set.seed(1)  # Setting seed for reproducibility
+random_numbers <- sample(1:463, 50)
+
+# Subset event_summary_df based on the selected random indices
+precision_plot_data <- event_summary_df[random_numbers, ]
+
+# Load GPS data files and call plot_selected_events for each file
+file_list <- list.files(path = "HMM_processed_data", pattern = ".csv", full.names = TRUE)
+
+for (i in 1:length(file_list)){
+  
+  gps_data <- read.csv(file_list[i])
+  
+  # Pass precision_plot_data to plot_selected_events instead of the full boat_events_hand_picked
+  plot_selected_events(gps_data, precision_plot_data)
+
+}
+
+```

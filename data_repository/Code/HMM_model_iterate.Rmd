@@ -1,0 +1,185 @@
+---
+title: "HMM model iterate"
+output: html_notebook
+---
+
+This file contains code to run a Hidden Markov Model on GPS tracks, which uses step lengths and turning angles to determine different behavioral states along the track. The code performs 15 iterations of the HMM with different starting values each time. It then selects and stores the output of the best fitted model.
+
+The input CSV file should have the following columns:
+1. ID (string or integer): Unique identifier for each device or bird.
+2. track_ID (string or integer): Unique identifier for each track segment.
+3. time (datetime): Timestamp of each data point in the format "YYYY-MM-DD HH:MM:SS".
+4. x (numeric): UTM x-coordinate of the data point.
+5. y (numeric): UTM y-coordinate of the data point.
+
+This code was written by Dr. E.N. (Eldar) Rakhimberdiev and adapted by Eva de Jonghe. The script is based on this paper: https://doi.org/10.1111/2041-210X.13745 by Cullen et al., 2021
+but with the extended code for the momentuHMM package.https://doi.org/10.1111/2041-210X.12995 by McClintock and Théo Michelot, 2017.
+
+```{r}
+# Load required libraries
+library(momentuHMM)
+library(bayesmove)
+library(tidyverse)
+library(terra)
+```
+
+# prepare data for HMM model
+```{r}
+# read in data
+gullsubs <- read.csv("C:/Users/edejonghe/Documents/Thesis/7062_data_010122_311222_processed.csv")
+
+# change the "ID" column so the HMM takes separate tracks into account
+gullsubs <- gullsubs %>% rename("device" = "ID", "ID" = "track_ID")
+
+# if HMM gives the error that there are not enough input values --> remove duplicates
+#gullsubs <- gullsubs[!duplicated(gullsubs[2]), ] 
+
+# for subsetting large datasets
+#gullsubs <- gull5999 |> subset(date_time > as.POSIXct('2021-04-09 00:00:00', tz="UTC") & date_time < as.POSIXct('2021-07-09 00:00:00', tz="UTC")) # this one worked well for me...
+
+# transform data into lists for the HMM model
+d.list<- df_to_list(gullsubs, ind = "device")
+list1<- map(d.list, ~prepData(., type = "UTM", coordNames = c("x","y")))
+```
+
+# Fit HMM model
+```{r}
+#############################
+# Here the HMM model will be run for 15 iterations with different initial values.
+
+# Empty list for order selection
+k.models<- list()
+
+## K = 5
+allm<- list()
+niter<- 15
+stateNames <- c("Stationary", "Float","ARS", "Exploratory Flight", "Transit", "Trawler", "Shrimp boat")
+whichzero <- which(list1[[1]]$step == 0)
+propzero <- length(whichzero)/nrow(list1[[1]])
+zeromass0 <- c(propzero, propzero, 0, 0)        #for zero distances by state
+    
+for (i in 1:niter) {
+  print(paste("K=7"))
+  print(paste("Iteration", i))
+      
+  # Mean Step length for different states
+  stepMean0 <- runif(7, min = c(0.01, 50,  10,  500, 2000, 800, 400),
+                        max = c(5, 300, 500, 2000, 5000, 1000, 500))
+
+  # Step length standard deviation
+  stepSD0 <- runif(7, min = c(0.1, 10, 50, 500, 500, 11, 5),
+                      max = c(1, 100, 250, 1500, 1500, 101, 50))
+
+
+  # Mean turning angle for different states
+  angleMean0 <- c(pi, 0, pi, 0, 0, pi, pi)
+      
+  # Turning angle concentration
+  angleCon0 <- runif(7, min = c(0.01, 0.8, 0, 0.1, 0.5, 0, 0),
+                        max = c(0.5, 0.99, 0.5, 0.5, 0.99, 0.6, 0.6))
+      
+  # Fit HMM model
+  if(propzero > 0) {  #don't include zero mass if no 0s present
+        
+    stepPar0 <- c(stepMean0, stepSD0, zeromass0)
+      
+    } else {
+        
+      stepPar0 <- c(stepMean0, stepSD0)
+      
+      }
+      
+  anglePar0 <- c(angleMean0, angleCon0)
+	  
+  start.time<- Sys.time() # measure elapsed time per iteration
+
+  Trial <- fitHMM(data = list1[[1]], nbStates = 7,
+                  Par0 = list(step = stepPar0, angle = anglePar0),
+                  dist = list(step = "gamma", angle = "wrpcauchy"),
+                  formula = ~ 1, stationary=TRUE, #stationary for a slightly better fit
+                  estAngleMean = list(angle=TRUE),
+                  stateNames = stateNames,
+                  optMethod = "Nelder-Mead") 
+	 
+  end.time<- Sys.time()
+  elapsed.time<- difftime(end.time, start.time, units = "min")
+  cat  ('time elapsed:\n')
+	print(elapsed.time)
+     
+	if(!inherits(Trial, "try-error")) {
+      
+	  allm[[i]]<-Trial 
+    print(Trial) }
+    
+	}
+   
+# save model output
+save(allm, file='first_run_5_states_15_models_3_monts.RData')
+# allm_old<-allm
+
+# Extract likelihoods of fitted models
+allnllk_list<-lapply(allm, function(m) m$mod$minimum)
+allnllk_list[unlist(lapply(allnllk_list, is.null))]<-NA
+allnllk <- unlist(allnllk_list)
+
+# Index of best fitting model (smallest negative log-likelihood)
+whichbest <- which.min(allnllk)
+    
+# Best fitting model
+best_model<- allm[[whichbest]]
+# save best model data
+save(best_model, file = 'best_model_080724.RData')
+saveRDS(best_model, "best_model_080724.rds") #saves the model in device
+
+```
+
+# save outcome
+```{r}
+# extract the states found by the HMM
+States <- viterbi(best_model)
+gullsubs$States <- States # add them to dataset
+
+write.csv(gullsubs,"C:/Users/edejonghe/Documents/Thesis/7062_data_010122_311222_processed.csv", row.names = FALSE) # save dataset
+
+```
+
+# plot outcome    
+```{r}
+# model output and diagnostics
+plot(best_model)
+ 
+plot(Trial)
+
+plotPR(best_model)
+
+# plot (part of) tracks with predictions
+par(mfrow=c(2,1))
+Colors=c('red','brown', 'pink', 'orange', 'blue', 'green', 'darkgreen')
+plot(gullsubs$y~gullsubs$time, type='l')
+points(gullsubs$y~gullsubs$time, pch='+', col=Colors[States])
+
+plot(gullsubs$x~gullsubs$date_time, type='l')
+points(gullsubs$x~gullsubs$date_time, pch='+', col=Colors[States])
+
+plot(gullsubs$dist~gullsubs$date_time, type='l')
+points(gullsubs$dist~gullsubs$date_time, pch='+', col=Colors[States])
+
+#
+cur_set<-1:50
+cur_set<-301:600
+Colors=c('red','brown', 'pink', 'orange', 'blue', 'green', 'darkgreen')
+plot(gullsubs$y[cur_set]~gullsubs$time[cur_set], type='l')
+points(gullsubs$y[cur_set]~gullsubs$time[cur_set], pch='+', col=Colors[States[cur_set]])
+
+plot(gullsubs$x[cur_set]~gullsubs$date_time[cur_set], type='l')
+points(gullsubs$x[cur_set]~gullsubs$date_time[cur_set], pch='+', col=Colors[States[cur_set]])
+
+plot(gullsubs$y[cur_set]~gullsubs$x[cur_set], type='l')
+points(gullsubs$y[cur_set]~gullsubs$x[cur_set], pch='+', col=Colors[States[cur_set]])
+
+legend(x = "topleft",          # Position
+       legend = stateNames,  # Legend texts
+       lty = c(1),           # Line types
+       col = Colors,           # Line colors
+       lwd = 1)                 # Line width
+```
